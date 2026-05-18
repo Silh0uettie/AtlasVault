@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "atlasvault"
+version = "0.1.0"
+description = "Portable local knowledge libraries with configurable parsing, embedding, retrieval, and generation."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "AtlasVault contributors" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+rag = [
+  "llama-index>=0.12",
+]
+docling = [
+  "docling>=2",
+  "llama-index-readers-docling>=0.3",
+  "llama-index-node-parser-docling>=0.3",
+]
+local-models = [
+  "llama-index-llms-ollama>=0.5",
+  "llama-index-embeddings-huggingface>=0.5",
+  "llama-index-embeddings-ollama>=0.5",
+]
+openai = [
+  "llama-index-llms-openai>=0.3",
+  "llama-index-embeddings-openai>=0.3",
+]
+chroma = [
+  "chromadb>=0.5",
+  "llama-index-vector-stores-chroma>=0.4",
+]
+dev = [
+  "pytest>=8",
+  "ruff>=0.8",
+]
+
+[project.scripts]
+atlasvault = "atlasvault.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atlasvault"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+

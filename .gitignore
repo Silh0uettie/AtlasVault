@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+*.pyc.*
+.pytest_cache/
+.ruff_cache/
+.scratch/
+*.egg-info/
+dist/
+build/
+
+# Local environments and editor state
+.venv/
+venv/
+.env
+.env.*
+.vscode/
+.idea/
+
+# AtlasVault library/runtime data
+atlasvault.toml
+manifest.json
+sources/
+parsed/
+index/
+metadata/
+eval/
+*.db
+*.db-shm
+*.db-wal
+
+# OS files
+.DS_Store
+Thumbs.db
