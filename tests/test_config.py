@@ -1,5 +1,6 @@
 from atlasvault.config import AtlasVaultConfig
 from atlasvault.library import AtlasVault
+from atlasvault.library import AtlasVaultError
 from atlasvault.manifest import Manifest
 from atlasvault.metadata import MetadataStore
 import pytest
@@ -139,6 +140,22 @@ def test_duplicate_filter_skips_existing_hash(tmp_path):
     assert filtered_records == []
 
 
+def test_failed_ingest_does_not_mark_documents_as_ingested(tmp_path):
+    source = tmp_path / "note.txt"
+    source.write_text("alpha beta", encoding="utf-8")
+    library = AtlasVault.create(tmp_path / "library", name="notes")
+
+    def fail_ingest(*args, **kwargs):
+        raise AtlasVaultError("boom")
+
+    library._ingest_with_llamaindex = fail_ingest
+
+    with pytest.raises(AtlasVaultError, match="boom"):
+        library.ingest(source, archive_sources=False)
+
+    assert library.metadata.list_documents() == []
+
+
 def test_sync_reconcile_removes_missing_documents(tmp_path):
     library = AtlasVault.create(tmp_path / "library", name="notes", input_mode="sync")
     existing = tmp_path / "existing.txt"
@@ -151,5 +168,43 @@ def test_sync_reconcile_removes_missing_documents(tmp_path):
     paths = [record["path"] for record in library.metadata.list_documents()]
     assert str(existing) in paths
     assert str(tmp_path / "missing.txt") not in paths
+
+
+def test_sync_deletion_reindexes_all_current_files(tmp_path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    existing = input_dir / "existing.txt"
+    added = input_dir / "added.txt"
+    existing.write_text("alpha", encoding="utf-8")
+    added.write_text("beta", encoding="utf-8")
+
+    library = AtlasVault.create(
+        tmp_path / "library",
+        name="notes",
+        input_dir=input_dir,
+        input_mode="sync",
+    )
+    existing_record = library._records_for_input_files([existing], archive=False)[0]
+    library.metadata.upsert_document(existing_record)
+    library.metadata.upsert_document(
+        {"path": str(input_dir / "missing.txt"), "sha256": "def", "size": 5}
+    )
+
+    captured = {}
+
+    def capture_ingest(_ingest_root, *, input_files=None, file_records=None):
+        captured["input_files"] = input_files
+        captured["file_records"] = file_records
+        for record in file_records:
+            library.metadata.upsert_document(record)
+
+    library._ingest_with_llamaindex = capture_ingest
+    library.ingest()
+
+    assert set(captured["input_files"]) == {existing, added}
+    assert {record["path"] for record in captured["file_records"]} == {
+        str(existing.resolve()),
+        str(added.resolve()),
+    }
 
 

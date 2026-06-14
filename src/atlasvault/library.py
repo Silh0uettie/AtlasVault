@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Iterable
 import os
 import shutil
+import sqlite3
 
 from atlasvault.config import CONFIG_FILE, AtlasVaultConfig
 from atlasvault.manifest import Manifest, file_record
@@ -24,7 +25,10 @@ class AtlasVault:
         self.path = Path(path).expanduser().resolve()
         self.config = config or AtlasVaultConfig.load(self.path)
         self.config.validate()
-        self.metadata = MetadataStore(self.path, self.config.paths.metadata_dir)
+        try:
+            self.metadata = MetadataStore(self.path, self.config.paths.metadata_dir)
+        except (OSError, sqlite3.Error) as exc:
+            raise AtlasVaultError(f"Could not open metadata store at {self.path}: {exc}") from exc
 
     @classmethod
     def create(
@@ -55,14 +59,24 @@ class AtlasVault:
         if overwrite:
             cls._clear_managed_layout(library_path)
 
-        config.save(library_path)
-        library = cls(library_path, config)
-        library.ensure_layout()
+        try:
+            config.save(library_path)
+            library = cls(library_path, config)
+            library.ensure_layout()
 
-        manifest = Manifest.load_or_create(library_path)
-        manifest.pipeline = config.to_dict()
-        manifest.save(library_path)
-        return library
+            manifest = Manifest.load_or_create(library_path)
+            manifest.pipeline = config.to_dict()
+            manifest.save(library_path)
+            return library
+        except (AtlasVaultError, OSError, sqlite3.Error) as exc:
+            cleanup_message = ""
+            try:
+                cls._clear_managed_layout(library_path)
+            except OSError as cleanup_exc:
+                cleanup_message = f" Cleanup of partial files also failed: {cleanup_exc}"
+            raise AtlasVaultError(
+                f"Could not create library at {library_path}: {exc}.{cleanup_message}"
+            ) from exc
 
     @staticmethod
     def _clear_managed_layout(library_path: Path) -> None:
@@ -105,7 +119,7 @@ class AtlasVault:
         removed_for_sync = False
         if self.config.input.mode == "sync":
             removed_for_sync = self._reconcile_sync_deletions(original_files)
-        if self.config.input.duplicate_check:
+        if self.config.input.duplicate_check and not removed_for_sync:
             original_files, file_records = self._filter_duplicate_inputs(original_files, file_records)
         if not original_files:
             if removed_for_sync:
@@ -118,12 +132,13 @@ class AtlasVault:
         else:
             ingest_root = source_path.parent if source_path.is_file() else source_path
             input_files = original_files
-        for record in file_records:
-            self.metadata.upsert_document(record)
         if removed_for_sync:
-            self.rebuild_index()
-            return
-        self._ingest_with_llamaindex(ingest_root, input_files=input_files)
+            self._clear_index()
+        self._ingest_with_llamaindex(
+            ingest_root,
+            input_files=input_files,
+            file_records=file_records,
+        )
         self._write_manifest()
 
     def run(self) -> None:
@@ -304,6 +319,7 @@ class AtlasVault:
         self,
         ingest_root: Path,
         input_files: list[Path] | None = None,
+        file_records: list[dict[str, Any]] | None = None,
     ) -> None:
         try:
             from llama_index.core import VectorStoreIndex
@@ -324,7 +340,10 @@ class AtlasVault:
         storage_context = self._storage_context_for_ingest()
         index = VectorStoreIndex(nodes, storage_context=storage_context)
         index.storage_context.persist(persist_dir=str(self._llamaindex_storage_dir()))
-        self._write_chunks_metadata(nodes)
+        if file_records is None:
+            self._write_chunks_metadata(nodes)
+        else:
+            self.metadata.replace_documents_and_chunks(file_records, nodes)
 
     def _load_llamaindex(self):
         try:

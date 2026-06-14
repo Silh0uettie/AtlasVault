@@ -72,93 +72,122 @@ class MetadataStore:
             )
 
     def upsert_document(self, record: dict[str, Any]) -> int:
+        with self._connect() as conn:
+            return self._upsert_document(conn, record)
+
+    def replace_documents_and_chunks(
+        self,
+        records: Iterable[dict[str, Any]],
+        nodes: Iterable[object],
+    ) -> None:
+        grouped = self._group_nodes_by_source(nodes)
+        with self._connect() as conn:
+            for record in records:
+                self._upsert_document(conn, record)
+            for source_path, source_nodes in grouped.items():
+                document_id = self._document_id_for_source(conn, source_path)
+                conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+                self._insert_chunks(conn, document_id, source_nodes)
+
+    def _upsert_document(self, conn: sqlite3.Connection, record: dict[str, Any]) -> int:
         source_path = str(record["path"])
         file_name = Path(source_path).name
         metadata = dict(record.get("metadata") or {})
         authors = metadata.get("authors", [])
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO documents (
-                    source_path, file_name, file_type, sha256, size, modified_at,
-                    title, authors_json, year, doi, metadata_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source_path) DO UPDATE SET
-                    file_name=excluded.file_name,
-                    file_type=excluded.file_type,
-                    sha256=excluded.sha256,
-                    size=excluded.size,
-                    modified_at=excluded.modified_at,
-                    title=excluded.title,
-                    authors_json=excluded.authors_json,
-                    year=excluded.year,
-                    doi=excluded.doi,
-                    metadata_json=excluded.metadata_json
-                """,
-                (
-                    source_path,
-                    file_name,
-                    metadata.get("file_type"),
-                    record.get("sha256"),
-                    record.get("size"),
-                    record.get("modified_at"),
-                    metadata.get("title"),
-                    json.dumps(authors if isinstance(authors, list) else []),
-                    metadata.get("year"),
-                    metadata.get("doi"),
-                    json.dumps(metadata, ensure_ascii=False, sort_keys=True),
-                ),
+        conn.execute(
+            """
+            INSERT INTO documents (
+                source_path, file_name, file_type, sha256, size, modified_at,
+                title, authors_json, year, doi, metadata_json
             )
-            row = conn.execute(
-                "SELECT id FROM documents WHERE source_path = ?",
-                (source_path,),
-            ).fetchone()
-            return int(row["id"])
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_path) DO UPDATE SET
+                file_name=excluded.file_name,
+                file_type=excluded.file_type,
+                sha256=excluded.sha256,
+                size=excluded.size,
+                modified_at=excluded.modified_at,
+                title=excluded.title,
+                authors_json=excluded.authors_json,
+                year=excluded.year,
+                doi=excluded.doi,
+                metadata_json=excluded.metadata_json
+            """,
+            (
+                source_path,
+                file_name,
+                metadata.get("file_type"),
+                record.get("sha256"),
+                record.get("size"),
+                record.get("modified_at"),
+                metadata.get("title"),
+                json.dumps(authors if isinstance(authors, list) else []),
+                metadata.get("year"),
+                metadata.get("doi"),
+                json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+        row = conn.execute(
+            "SELECT id FROM documents WHERE source_path = ?",
+            (source_path,),
+        ).fetchone()
+        return int(row["id"])
 
     def replace_chunks_for_nodes(self, nodes: Iterable[object]) -> None:
+        grouped = self._group_nodes_by_source(nodes)
+        with self._connect() as conn:
+            for source_path, source_nodes in grouped.items():
+                document_id = self._document_id_for_source(conn, source_path)
+                conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+                self._insert_chunks(conn, document_id, source_nodes)
+
+    def _group_nodes_by_source(self, nodes: Iterable[object]) -> dict[str, list[object]]:
         grouped: dict[str, list[object]] = {}
         for node in nodes:
             metadata = dict(getattr(node, "metadata", {}) or {})
             source_path = metadata.get("source_path") or metadata.get("file_path") or "unknown"
             grouped.setdefault(str(source_path), []).append(node)
+        return grouped
 
-        with self._connect() as conn:
-            for source_path, source_nodes in grouped.items():
-                row = conn.execute(
-                    "SELECT id FROM documents WHERE source_path = ?",
-                    (source_path,),
-                ).fetchone()
-                if row is None:
-                    document_id = self.upsert_document({"path": source_path, "metadata": {}})
-                else:
-                    document_id = int(row["id"])
+    def _document_id_for_source(self, conn: sqlite3.Connection, source_path: str) -> int:
+        row = conn.execute(
+            "SELECT id FROM documents WHERE source_path = ?",
+            (source_path,),
+        ).fetchone()
+        if row is None:
+            return self._upsert_document(conn, {"path": source_path, "metadata": {}})
+        return int(row["id"])
 
-                conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
-                for index, node in enumerate(source_nodes):
-                    metadata = dict(getattr(node, "metadata", {}) or {})
-                    chunk_index = int(metadata.get("chunk_index", index))
-                    text = node.get_content() if hasattr(node, "get_content") else str(node)
-                    page = parse_optional_int(metadata.get("page_label") or metadata.get("page"))
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO chunks (
-                            id, document_id, chunk_index, text, page, section,
-                            token_count, metadata_json
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            str(getattr(node, "node_id", metadata.get("id", ""))),
-                            document_id,
-                            chunk_index,
-                            text,
-                            page,
-                            metadata.get("section"),
-                            metadata.get("token_count"),
-                            json.dumps(metadata, ensure_ascii=False, sort_keys=True),
-                        ),
-                    )
+    def _insert_chunks(
+        self,
+        conn: sqlite3.Connection,
+        document_id: int,
+        source_nodes: Iterable[object],
+    ) -> None:
+        for index, node in enumerate(source_nodes):
+            metadata = dict(getattr(node, "metadata", {}) or {})
+            chunk_index = int(metadata.get("chunk_index", index))
+            text = node.get_content() if hasattr(node, "get_content") else str(node)
+            page = parse_optional_int(metadata.get("page_label") or metadata.get("page"))
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO chunks (
+                    id, document_id, chunk_index, text, page, section,
+                    token_count, metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(getattr(node, "node_id", metadata.get("id", ""))),
+                    document_id,
+                    chunk_index,
+                    text,
+                    page,
+                    metadata.get("section"),
+                    metadata.get("token_count"),
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                ),
+            )
 
     def list_documents(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
